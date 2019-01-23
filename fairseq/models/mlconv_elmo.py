@@ -22,6 +22,12 @@ from . import (
     register_model, register_model_architecture,
 )
 
+# ELMo
+options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
+               "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
+weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
+              "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
+
 
 @register_model('fconv_elmo')
 class FConvModel(FairseqModel):
@@ -101,17 +107,9 @@ class FConvModel(FairseqModel):
             decoder_embed_dict = utils.parse_embedding(args.decoder_embed_path)
             utils.print_embed_overlap(decoder_embed_dict, task.target_dictionary)
 
-        # ELMo
-        options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
-                       "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
-        weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
-                      "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
-        elmo = Elmo(options_file, weight_file, args.num_output_repr,
-                    dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
-
         encoder = FConvEncoder(
             dictionary=task.source_dictionary,
-            elmo=elmo, args=args,
+            args=args,
             embed_dim=args.encoder_embed_dim,
             embed_dict=encoder_embed_dict,
             convolutions=eval(args.encoder_layers),
@@ -120,7 +118,7 @@ class FConvModel(FairseqModel):
         )
         decoder = FConvDecoder(
             dictionary=task.target_dictionary,
-            elmo=elmo, args=args,
+            args=args,
             embed_dim=args.decoder_embed_dim,
             embed_dict=decoder_embed_dict,
             convolutions=eval(args.decoder_layers),
@@ -154,12 +152,13 @@ class FConvEncoder(FairseqEncoder):
     """
 
     def __init__(
-            self, dictionary, elmo, args,
+            self, dictionary, args,
             embed_dim=512, embed_dict=None, max_positions=1024,
             convolutions=((512, 3),) * 20, dropout=0.1, left_pad=True
     ):
         super().__init__(dictionary)
-        self.elmo = elmo
+        self.elmo = Elmo(options_file, weight_file, args.num_output_repr,
+                         dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
         self.elmo_projection = Linear(1024, embed_dim)
         self.args = args
         self.id2token = {v: k for k, v in dictionary.indices.items()}
@@ -226,7 +225,7 @@ class FConvEncoder(FairseqEncoder):
                 - **encoder_padding_mask** (ByteTensor): the positions of
                   padding elements of shape `(batch, src_len)`
         """
-        # TODO optimization here
+        # ELMo
         src_sens = src_tokens.cpu().numpy().tolist()
         for i in range(len(src_sens)):
             for j in range(len(src_sens[i])):
@@ -299,9 +298,10 @@ class FConvEncoder(FairseqEncoder):
 
         # project back to size of embedding
         x = self.fc2(x)
-        # TODO right?
+
+        # ELMo
         if output_elmo_embeds is not None:
-            x = x + output_elmo_embeds
+            x += output_elmo_embeds
 
         if encoder_padding_mask is not None:
             encoder_padding_mask = encoder_padding_mask.t()  # -> B x T
@@ -390,7 +390,7 @@ class FConvDecoder(FairseqIncrementalDecoder):
     """Convolutional decoder"""
 
     def __init__(
-            self, dictionary, elmo, args,
+            self, dictionary, args,
             embed_dim=512, embed_dict=None, out_embed_dim=256,
             max_positions=1024, convolutions=((512, 3),) * 20, attention=True,
             dropout=0.1, share_embed=False, positional_embeddings=True,
@@ -398,6 +398,11 @@ class FConvDecoder(FairseqIncrementalDecoder):
             left_pad=False
     ):
         super().__init__(dictionary)
+        self.elmo = Elmo(options_file, weight_file, 1,
+                         dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
+        self.input_elmo_projection = Linear(1024, embed_dim)
+        self.args = args
+        self.id2token = {v: k for k, v in dictionary.indices.items()}
         self.register_buffer('version', torch.Tensor([2]))
         self.dropout = dropout
         self.left_pad = left_pad
@@ -480,12 +485,28 @@ class FConvDecoder(FairseqIncrementalDecoder):
         else:
             pos_embed = 0
 
-        if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-        x = self._embed_tokens(prev_output_tokens, incremental_state)
+        # ELMo
+        prev_sens = prev_output_tokens.cpu().numpy().tolist()
+        for i in range(len(prev_sens)):
+            for j in range(len(prev_sens[i])):
+                prev_sens[i][j] = self.id2token[prev_sens[i][j]]
+        char_ids = batch_to_ids(prev_sens)
+        elmo_embeds = self.elmo(char_ids.to('cuda'))
+        elmo_embeds = elmo_embeds['elmo_representations']
+        input_elmo_embeds = elmo_embeds[0]
+        if torch.cuda.is_available():
+            input_elmo_embeds = input_elmo_embeds.to('cuda')
+        input_elmo_embeds = self.input_elmo_projection(input_elmo_embeds)
 
         # embed tokens and combine with positional embeddings
-        x += pos_embed
+        if self.args.use_other_embed:
+            if incremental_state is not None:
+                prev_output_tokens = prev_output_tokens[:, -1:]
+            x = self._embed_tokens(prev_output_tokens, incremental_state)
+            x += pos_embed + input_elmo_embeds
+        else:
+            x = input_elmo_embeds + pos_embed
+
         x = F.dropout(x, p=self.dropout, training=self.training)
         target_embedding = x
 
