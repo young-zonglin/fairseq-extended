@@ -58,17 +58,6 @@ class FConvModel(FairseqModel):
         # fmt: off
         parser.add_argument('--dropout', type=float, metavar='D',
                             help='dropout probability')
-        # ELMo
-        parser.add_argument('--num-output-repr', type=int, metavar='N',
-                            help='The num of ELMo repr to output with diff'
-                                 'linear weighted combination of the 3 layers')
-        parser.add_argument('--elmo-dropout', type=float, metavar='D',
-                            help='elmo dropout probability')
-        parser.add_argument('--elmo-do-layer-norm', action='store_true',
-                            help='whether to use layer normalization')
-        parser.add_argument('--use-other-embed', action='store_true',
-                            help='whether to use other word vectors')
-
         parser.add_argument('--encoder-embed-dim', type=int, metavar='N',
                             help='encoder embedding dimension')
         parser.add_argument('--encoder-embed-path', type=str, metavar='STR',
@@ -89,6 +78,22 @@ class FConvModel(FairseqModel):
                             help='share input and output embeddings (requires'
                                  ' --decoder-out-embed-dim and --decoder-embed-dim'
                                  ' to be equal)')
+        # ELMo
+        parser.add_argument('--num-output-repr', type=int, metavar='N',
+                            help='The num of ELMo repr to output with different'
+                                 'linear weighted combination of the 3 layers')
+        parser.add_argument('--use-other-embed', action='store_true',
+                            help='whether to use other word vectors')
+        parser.add_argument('--merge-mode', type=str, metavar='STR',
+                            help='how to merge elmo repr with token embed')
+        parser.add_argument('--token-embed-dim', type=int, metavar='N',
+                            help='valid only if `merge_mode` == concat')
+        parser.add_argument('--elmo-repr-dim', type=int, metavar='N',
+                            help='elmo representation dimension')
+        parser.add_argument('--elmo-dropout', type=float, metavar='D',
+                            help='elmo dropout probability')
+        parser.add_argument('--elmo-do-layer-norm', action='store_true',
+                            help='whether to use layer normalization')
         # fmt: on
 
     @classmethod
@@ -96,6 +101,19 @@ class FConvModel(FairseqModel):
         """Build a new model instance."""
         # make sure that all args are properly defaulted (in case there are any new ones)
         base_architecture(args)
+
+        if args.merge_mode not in ['concat', 'sum']:
+            raise ValueError('Invalid merge mode. '
+                             'Merge mode should be one of '
+                             '{"sum", "concat"}')
+        if args.encoder_embed_dim != args.decoder_embed_dim:
+            raise ValueError('encoder embedding dimension '
+                             'should be equal to '
+                             'decoder embedding dimension')
+        if args.merge_mode == 'sum' and args.token_embed_dim != args.encoder_embed_dim:
+            raise ValueError('token embedding dimension '
+                             'should be equal to '
+                             'encoder embedding dimension')
 
         encoder_embed_dict = None
         if args.encoder_embed_path:
@@ -110,7 +128,7 @@ class FConvModel(FairseqModel):
         encoder = FConvEncoder(
             dictionary=task.source_dictionary,
             args=args,
-            embed_dim=args.encoder_embed_dim,
+            encoder_embed_dim=args.encoder_embed_dim,
             embed_dict=encoder_embed_dict,
             convolutions=eval(args.encoder_layers),
             dropout=args.dropout,
@@ -119,7 +137,7 @@ class FConvModel(FairseqModel):
         decoder = FConvDecoder(
             dictionary=task.target_dictionary,
             args=args,
-            embed_dim=args.decoder_embed_dim,
+            decoder_embed_dim=args.decoder_embed_dim,
             embed_dict=decoder_embed_dict,
             convolutions=eval(args.decoder_layers),
             out_embed_dim=args.decoder_out_embed_dim,
@@ -153,13 +171,14 @@ class FConvEncoder(FairseqEncoder):
 
     def __init__(
             self, dictionary, args,
-            embed_dim=512, embed_dict=None, max_positions=1024,
+            encoder_embed_dim=512, embed_dict=None, max_positions=1024,
             convolutions=((512, 3),) * 20, dropout=0.1, left_pad=True
     ):
         super().__init__(dictionary)
         self.elmo = Elmo(options_file, weight_file, args.num_output_repr,
                          dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
-        self.elmo_projection = Linear(1024, embed_dim)
+        # just use in `sum` mode
+        self.elmo_projection = Linear(args.elmo_repr_dim, encoder_embed_dim)
         self.args = args
         self.id2token = {v: k for k, v in dictionary.indices.items()}
         self.dropout = dropout
@@ -168,20 +187,20 @@ class FConvEncoder(FairseqEncoder):
 
         num_embeddings = len(dictionary)
         self.padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, self.padding_idx)
+        self.embed_tokens = Embedding(num_embeddings, args.token_embed_dim, self.padding_idx)
         if embed_dict:
             self.embed_tokens = utils.load_embedding(embed_dict, self.dictionary, self.embed_tokens)
 
         self.embed_positions = PositionalEmbedding(
             max_positions,
-            embed_dim,
+            args.token_embed_dim,
             self.padding_idx,
             left_pad=self.left_pad,
         )
 
         convolutions = extend_conv_spec(convolutions)
         in_channels = convolutions[0][0]
-        self.fc1 = Linear(embed_dim, in_channels, dropout=dropout)
+        self.fc1 = Linear(encoder_embed_dim, in_channels, dropout=dropout)
         self.projections = nn.ModuleList()
         self.convolutions = nn.ModuleList()
         self.residuals = []
@@ -205,7 +224,10 @@ class FConvEncoder(FairseqEncoder):
             self.residuals.append(residual)
             in_channels = out_channels
             layer_in_channels.append(out_channels)
-        self.fc2 = Linear(in_channels, embed_dim)
+        if args.num_output_repr == 2 and args.merge_mode == 'concat':
+            self.fc2 = Linear(in_channels+args.elmo_repr_dim, encoder_embed_dim)
+        else:
+            self.fc2 = Linear(in_channels, encoder_embed_dim)
 
     def forward(self, src_tokens, src_lengths):
         """
@@ -241,16 +263,24 @@ class FConvEncoder(FairseqEncoder):
             input_elmo_embeds = input_elmo_embeds.to('cuda')
             if output_elmo_embeds is not None:
                 output_elmo_embeds = output_elmo_embeds.to('cuda')
-        input_elmo_embeds = self.elmo_projection(input_elmo_embeds)
-        if output_elmo_embeds is not None:
-            output_elmo_embeds = self.elmo_projection(output_elmo_embeds)
+        if self.args.merge_mode == 'sum':
+            input_elmo_embeds = self.elmo_projection(input_elmo_embeds)
+            if output_elmo_embeds is not None:
+                output_elmo_embeds = self.elmo_projection(output_elmo_embeds)
 
         if self.args.use_other_embed:
             # embed tokens and positions
-            x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens) + input_elmo_embeds
+            if self.args.merge_mode == 'sum':
+                x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens) + input_elmo_embeds
+            else:
+                x = self.embed_tokens(src_tokens) + self.embed_positions(src_tokens)
+                x = torch.cat((x, input_elmo_embeds), dim=-1)
         else:
             # just use ELMo repr
-            x = input_elmo_embeds + self.embed_positions(src_tokens)
+            if self.args.merge_mode == 'sum':
+                x = input_elmo_embeds + self.embed_positions(src_tokens)
+            else:
+                x = torch.cat((self.embed_positions(src_tokens), input_elmo_embeds), dim=-1)
 
         x = F.dropout(x, p=self.dropout, training=self.training)
         input_embedding = x
@@ -296,11 +326,15 @@ class FConvEncoder(FairseqEncoder):
         # T x B x C -> B x T x C
         x = x.transpose(1, 0)
 
+        # ELMo and `concat`
+        if output_elmo_embeds is not None and self.args.merge_mode == 'concat':
+            x = torch.cat((x, output_elmo_embeds), dim=-1)
+
         # project back to size of embedding
         x = self.fc2(x)
 
-        # ELMo
-        if output_elmo_embeds is not None:
+        # ELMo and `sum`
+        if output_elmo_embeds is not None and self.args.merge_mode == 'sum':
             x += output_elmo_embeds
 
         if encoder_padding_mask is not None:
@@ -391,7 +425,7 @@ class FConvDecoder(FairseqIncrementalDecoder):
 
     def __init__(
             self, dictionary, args,
-            embed_dim=512, embed_dict=None, out_embed_dim=256,
+            decoder_embed_dim=512, embed_dict=None, out_embed_dim=256,
             max_positions=1024, convolutions=((512, 3),) * 20, attention=True,
             dropout=0.1, share_embed=False, positional_embeddings=True,
             adaptive_softmax_cutoff=None, adaptive_softmax_dropout=0,
@@ -400,7 +434,8 @@ class FConvDecoder(FairseqIncrementalDecoder):
         super().__init__(dictionary)
         self.elmo = Elmo(options_file, weight_file, 1,
                          dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
-        self.input_elmo_projection = Linear(1024, embed_dim)
+        # only use in `sum`
+        self.input_elmo_projection = Linear(args.elmo_repr_dim, decoder_embed_dim)
         self.args = args
         self.id2token = {v: k for k, v in dictionary.indices.items()}
         self.register_buffer('version', torch.Tensor([2]))
@@ -419,18 +454,18 @@ class FConvDecoder(FairseqIncrementalDecoder):
 
         num_embeddings = len(dictionary)
         padding_idx = dictionary.pad()
-        self.embed_tokens = Embedding(num_embeddings, embed_dim, padding_idx)
+        self.embed_tokens = Embedding(num_embeddings, args.token_embed_dim, padding_idx)
         if embed_dict:
             self.embed_tokens = utils.load_embedding(embed_dict, self.dictionary, self.embed_tokens)
 
         self.embed_positions = PositionalEmbedding(
             max_positions,
-            embed_dim,
+            args.token_embed_dim,
             padding_idx,
             left_pad=self.left_pad,
         ) if positional_embeddings else None
 
-        self.fc1 = Linear(embed_dim, in_channels, dropout=dropout)
+        self.fc1 = Linear(decoder_embed_dim, in_channels, dropout=dropout)
         self.projections = nn.ModuleList()
         self.convolutions = nn.ModuleList()
         self.attention = nn.ModuleList()
@@ -448,7 +483,7 @@ class FConvDecoder(FairseqIncrementalDecoder):
                 LinearizedConv1d(in_channels, out_channels * 2, kernel_size,
                                  padding=(kernel_size - 1), dropout=dropout)
             )
-            self.attention.append(AttentionLayer(out_channels, embed_dim)
+            self.attention.append(AttentionLayer(out_channels, decoder_embed_dim)
                                   if attention[i] else None)
             self.residuals.append(residual)
             in_channels = out_channels
@@ -464,9 +499,9 @@ class FConvDecoder(FairseqIncrementalDecoder):
         else:
             self.fc2 = Linear(in_channels, out_embed_dim)
             if share_embed:
-                assert out_embed_dim == embed_dim, \
+                assert out_embed_dim == decoder_embed_dim, \
                     "Shared embed weights implies same dimensions " \
-                    " out_embed_dim={} vs embed_dim={}".format(out_embed_dim, embed_dim)
+                    " out_embed_dim={} vs embed_dim={}".format(out_embed_dim, decoder_embed_dim)
                 self.fc3 = nn.Linear(out_embed_dim, num_embeddings)
                 self.fc3.weight = self.embed_tokens.weight
             else:
@@ -496,16 +531,24 @@ class FConvDecoder(FairseqIncrementalDecoder):
         input_elmo_embeds = elmo_embeds[0]
         if torch.cuda.is_available():
             input_elmo_embeds = input_elmo_embeds.to('cuda')
-        input_elmo_embeds = self.input_elmo_projection(input_elmo_embeds)
+        if self.args.merge_mode == 'sum':
+            input_elmo_embeds = self.input_elmo_projection(input_elmo_embeds)
 
         # embed tokens and combine with positional embeddings
         if self.args.use_other_embed:
             if incremental_state is not None:
                 prev_output_tokens = prev_output_tokens[:, -1:]
             x = self._embed_tokens(prev_output_tokens, incremental_state)
-            x += pos_embed + input_elmo_embeds
+            if self.args.merge_mode == 'sum':
+                x += pos_embed + input_elmo_embeds
+            else:
+                x += pos_embed
+                x = torch.cat((x, input_elmo_embeds), dim=-1)
         else:
-            x = input_elmo_embeds + pos_embed
+            if self.args.merge_mode == 'sum':
+                x = input_elmo_embeds + pos_embed
+            else:
+                x = torch.cat((input_elmo_embeds, pos_embed), dim=-1)
 
         x = F.dropout(x, p=self.dropout, training=self.training)
         target_embedding = x
@@ -679,10 +722,10 @@ def ConvTBC(in_channels, out_channels, kernel_size, dropout=0, **kwargs):
 def base_architecture(args):
     # These hyper-params are from NUS18.
     args.dropout = getattr(args, 'dropout', 0.2)
-    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 500)
+    args.encoder_embed_dim = getattr(args, 'encoder_embed_dim', 500+1024)
     args.encoder_embed_path = getattr(args, 'encoder_embed_path', None)
     args.encoder_layers = getattr(args, 'encoder_layers', '[(1024, 3)] * 7')
-    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 500)
+    args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 500+1024)
     args.decoder_embed_path = getattr(args, 'decoder_embed_path', None)
     args.decoder_layers = getattr(args, 'decoder_layers', '[(1024, 3)] * 7')
     args.decoder_out_embed_dim = getattr(args, 'decoder_out_embed_dim', 500)
@@ -690,7 +733,10 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
     # ELMo
     args.num_output_repr = getattr(args, 'num_output_repr', 1)
+    args.use_other_embed = getattr(args, 'use_other_embed', False)
+    args.merge_mode = getattr(args, 'merge_mode', 'concat')
+    args.token_embed_dim = getattr(args, 'token_embed_dim', 500)
+    args.elmo_repr_dim = getattr(args, 'elmo_repr_dim', 1024)
     args.elmo_dropout = getattr(args, 'elmo_dropout', 0.0)
     args.elmo_do_layer_norm = getattr(args, 'elmo_do_layer_norm', False)
-    args.use_other_embed = getattr(args, 'use_other_embed', False)
 
