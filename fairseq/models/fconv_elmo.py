@@ -538,6 +538,7 @@ class FConvDecoder(FairseqIncrementalDecoder):
         if self.args.use_other_embed:
             if incremental_state is not None:
                 prev_output_tokens = prev_output_tokens[:, -1:]
+                input_elmo_embeds = input_elmo_embeds[:, -1:, :]
             x = self._embed_tokens(prev_output_tokens, incremental_state)
             if self.args.merge_mode == 'sum':
                 x += pos_embed + input_elmo_embeds
