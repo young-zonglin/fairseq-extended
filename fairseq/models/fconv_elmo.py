@@ -23,10 +23,13 @@ from . import (
 )
 
 # ELMo
-options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
-               "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
-weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
-              "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
+# options_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
+#                "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_options.json"
+# weight_file = "https://s3-us-west-2.amazonaws.com/allennlp/models/elmo/" \
+#               "2x4096_512_2048cnn_2xhighway/elmo_2x4096_512_2048cnn_2xhighway_weights.hdf5"
+
+options_file = '/home/yangzl/Desktop/pycharm-projects/bilm-tf/bin/weights-options/options.json'
+weight_file = '/home/yangzl/Desktop/pycharm-projects/bilm-tf/bin/weights-options/ptb-weights.hdf5'
 
 
 @register_model('fconv_elmo')
