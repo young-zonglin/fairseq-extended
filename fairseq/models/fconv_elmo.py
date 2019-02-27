@@ -85,6 +85,8 @@ class FConvModel(FairseqModel):
         parser.add_argument('--num-output-repr', type=int, metavar='N',
                             help='The num of ELMo repr to output with different'
                                  'linear weighted combination of the 3 layers')
+        parser.add_argument('--use-elmo-decoder-input', action='store_true',
+                            help='whether to use ELMo repr in decoder input')
         parser.add_argument('--use-other-embed', action='store_true',
                             help='whether to use other word vectors')
         parser.add_argument('--merge-mode', type=str, metavar='STR',
@@ -180,9 +182,10 @@ class FConvEncoder(FairseqEncoder):
         super().__init__(dictionary)
         self.elmo = Elmo(options_file, weight_file, args.num_output_repr,
                          dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
-        # just use in `sum` mode
-        self.elmo_projection = Linear(args.elmo_repr_dim, encoder_embed_dim)
         self.args = args
+        if self.args.merge_mode == 'sum':
+            # just use in `sum` mode
+            self.elmo_projection = Linear(args.elmo_repr_dim, encoder_embed_dim)
         self.id2token = {v: k for k, v in dictionary.indices.items()}
         self.dropout = dropout
         self.left_pad = left_pad
@@ -435,11 +438,13 @@ class FConvDecoder(FairseqIncrementalDecoder):
             left_pad=False
     ):
         super().__init__(dictionary)
-        self.elmo = Elmo(options_file, weight_file, 1,
-                         dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
-        # only use in `sum`
-        self.input_elmo_projection = Linear(args.elmo_repr_dim, decoder_embed_dim)
         self.args = args
+        if self.args.use_elmo_decoder_input:
+            self.elmo = Elmo(options_file, weight_file, 1,
+                             dropout=args.elmo_dropout, do_layer_norm=args.elmo_do_layer_norm)
+            if self.args.merge_mode == 'sum':
+                # only use in `sum`
+                self.input_elmo_projection = Linear(args.elmo_repr_dim, decoder_embed_dim)
         self.id2token = {v: k for k, v in dictionary.indices.items()}
         self.register_buffer('version', torch.Tensor([2]))
         self.dropout = dropout
@@ -523,36 +528,46 @@ class FConvDecoder(FairseqIncrementalDecoder):
         else:
             pos_embed = 0
 
-        # ELMo
-        prev_sens = prev_output_tokens.cpu().numpy().tolist()
-        for i in range(len(prev_sens)):
-            for j in range(len(prev_sens[i])):
-                prev_sens[i][j] = self.id2token[prev_sens[i][j]]
-        char_ids = batch_to_ids(prev_sens)
-        elmo_embeds = self.elmo(char_ids.to('cuda'))
-        elmo_embeds = elmo_embeds['elmo_representations']
-        input_elmo_embeds = elmo_embeds[0]
-        if torch.cuda.is_available():
-            input_elmo_embeds = input_elmo_embeds.to('cuda')
-        if self.args.merge_mode == 'sum':
-            input_elmo_embeds = self.input_elmo_projection(input_elmo_embeds)
-
-        # embed tokens and combine with positional embeddings
-        if self.args.use_other_embed:
+        if not self.args.use_elmo_decoder_input:
             if incremental_state is not None:
                 prev_output_tokens = prev_output_tokens[:, -1:]
-                input_elmo_embeds = input_elmo_embeds[:, -1:, :]
             x = self._embed_tokens(prev_output_tokens, incremental_state)
-            if self.args.merge_mode == 'sum':
-                x += pos_embed + input_elmo_embeds
-            else:
-                x += pos_embed
-                x = torch.cat((x, input_elmo_embeds), dim=-1)
+
+            # embed tokens and combine with positional embeddings
+            x += pos_embed
+            # make sure `encoder_embed_dim` == `decoder_embed_dim`
+            x = pad_zeros(x, self.args.decoder_embed_dim)
         else:
+            # ELMo
+            prev_sens = prev_output_tokens.cpu().numpy().tolist()
+            for i in range(len(prev_sens)):
+                for j in range(len(prev_sens[i])):
+                    prev_sens[i][j] = self.id2token[prev_sens[i][j]]
+            char_ids = batch_to_ids(prev_sens)
+            elmo_embeds = self.elmo(char_ids.to('cuda'))
+            elmo_embeds = elmo_embeds['elmo_representations']
+            input_elmo_embeds = elmo_embeds[0]
+            if torch.cuda.is_available():
+                input_elmo_embeds = input_elmo_embeds.to('cuda')
             if self.args.merge_mode == 'sum':
-                x = input_elmo_embeds + pos_embed
+                input_elmo_embeds = self.input_elmo_projection(input_elmo_embeds)
+
+            # embed tokens and combine with positional embeddings
+            if self.args.use_other_embed:
+                if incremental_state is not None:
+                    prev_output_tokens = prev_output_tokens[:, -1:]
+                    input_elmo_embeds = input_elmo_embeds[:, -1:, :]
+                x = self._embed_tokens(prev_output_tokens, incremental_state)
+                if self.args.merge_mode == 'sum':
+                    x += pos_embed + input_elmo_embeds
+                else:
+                    x += pos_embed
+                    x = torch.cat((x, input_elmo_embeds), dim=-1)
             else:
-                x = torch.cat((input_elmo_embeds, pos_embed), dim=-1)
+                if self.args.merge_mode == 'sum':
+                    x = input_elmo_embeds + pos_embed
+                else:
+                    x = torch.cat((input_elmo_embeds, pos_embed), dim=-1)
 
         x = F.dropout(x, p=self.dropout, training=self.training)
         target_embedding = x
@@ -722,6 +737,26 @@ def ConvTBC(in_channels, out_channels, kernel_size, dropout=0, **kwargs):
     return nn.utils.weight_norm(m, dim=2)
 
 
+def pad_zeros(to_pad_tensor, out_features):
+    """
+    pad zeros to last dim to `out_features`
+    :param to_pad_tensor:
+    :param out_features:
+    :return: zeros padded tensor
+    """
+    shape = to_pad_tensor.size()
+    in_features = shape[len(shape)-1]
+    to_pad = out_features - in_features
+    if to_pad <= 0:
+        return to_pad_tensor
+    shape = [i for i in shape]
+    shape[len(shape) - 1] = to_pad
+    zeros = torch.zeros(shape)
+    if torch.cuda.is_available():
+        zeros = zeros.to('cuda')
+    return torch.cat((to_pad_tensor, zeros), dim=-1)
+
+
 @register_model_architecture('fconv_elmo', 'fconv_elmo')
 def base_architecture(args):
     # These hyper-params are from NUS18.
@@ -737,6 +772,7 @@ def base_architecture(args):
     args.share_input_output_embed = getattr(args, 'share_input_output_embed', False)
     # ELMo
     args.num_output_repr = getattr(args, 'num_output_repr', 1)
+    args.use_elmo_decoder_input = getattr(args, 'use_elmo_decoder_input', False)
     args.use_other_embed = getattr(args, 'use_other_embed', False)
     args.merge_mode = getattr(args, 'merge_mode', 'concat')
     args.token_embed_dim = getattr(args, 'token_embed_dim', 500)
